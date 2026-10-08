@@ -208,12 +208,32 @@ verification. The smallest stateful fixture uses about **10.94 million units
 (0.099%)**, and the largest uses about **65.05 million units (0.591%)**, for
 those same two components.
 
-These totals exclude the verifier's serialized code, public key, message hash,
-atom/list encoding, generator overhead, conditions and other spend costs.
-For example, a full 4,704-byte copy of the verifier would add **56,448,000**
-byte-cost units before any block-generator compression or sharing. The payload
-figures above exclude even the signature atom's length prefix. Full transaction
-cost depends on how the puzzle and generator encode and share these bytes.
+### Verifier code and combined cost
+
+The compiled validation program is **4,704 bytes**. At 12,000 units per byte,
+one uncompressed copy costs **56,448,000 units**, or **0.513% of a block**,
+separate from its execution cost. Including that copy gives these estimates:
+
+| Signature | Signature bytes + measured execution | Including one verifier copy | Share of block budget including code |
+| --- | ---: | ---: | ---: |
+| Smallest stateful | 10.94 million | 67.39 million | 0.613% |
+| Largest stateful | 65.05 million | 121.50 million | 1.105% |
+| Stateless | 96.80–97.67 million | 153.24–154.12 million | 1.393–1.401% |
+
+The verifier can be deduplicated when used multiple times in the same block
+generator. If a generator shares one copy across `N` validations, its code
+contributes approximately **56,448,000 / N units per validation**, plus the
+encoding/reference overhead needed to share it. Signature payload and
+verification execution still contribute their respective per-validation costs.
+This sharing must be represented in the generator; the table above assumes a
+full uncompressed copy for each validation, and deduplication does not persist
+across blocks.
+
+These estimates exclude public-key and message-hash bytes, atom/list encoding
+(including the signature atom's length prefix), generator overhead, conditions
+and other spend costs. Full transaction cost depends on how the puzzle and
+generator encode and share these bytes. The execution figures remain measured
+samples rather than proven worst-case bounds.
 
 ## Regenerate vectors
 
