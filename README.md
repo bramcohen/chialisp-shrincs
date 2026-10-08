@@ -22,6 +22,115 @@ The draft is evolving; updating it requires regenerating vectors and reviewing
 wire formats, parameters, and domain separation. This implementation has not
 undergone a cryptographic security review.
 
+## Key generation and signing
+
+This repository implements verification in Chialisp. Key generation and signing
+run off-chain; the examples below use the pinned [upstream Python reference](https://github.com/SHRINCS/shrincs-bip/blob/a5891ec5b360a732c097e1d6af1ae59515a2560a/impl/shrincs.py).
+That reference is demonstration code without persistent state management or
+secret-key protection, rather than a production wallet signer.
+
+The reference API does **not** take a bare 32-byte private key:
+
+| Value | Size | Contents |
+| --- | ---: | --- |
+| Key-generation seed | 48 bytes | `sk_seed[16] || sk_prf[16] || pk_seed[16]` |
+| Stateful tree configuration | 2 bytes | Shape byte followed by depth byte |
+| Expanded secret key | 82 bytes | `sk_seed || sk_prf || pk_seed || sl_root || sf_structure || sf_root` |
+| Public key | 48 bytes | `pk_seed || sl_root || sf_root` |
+
+Generate the seed with a cryptographically secure random source. The stateful
+counter is separate from the 82-byte secret key; the signer must store and
+manage it. A seed backup must also preserve the two-byte tree configuration to
+reconstruct the same keypair.
+
+Fetch the exact reference revision (Python standard library only):
+
+```sh
+curl --fail -L https://raw.githubusercontent.com/SHRINCS/shrincs-bip/a5891ec5b360a732c097e1d6af1ae59515a2560a/impl/shrincs.py -o /tmp/shrincs_reference.py
+```
+
+Save the following as `/tmp/shrincs_example.py` and run it with
+`python3 /tmp/shrincs_example.py`. It generates a fresh disposable key and uses
+its first stateful counter exactly once:
+
+```python
+import hashlib
+from pathlib import Path
+import secrets
+
+# Verify the downloaded reference before importing it.
+reference_path = Path('/tmp/shrincs_reference.py')
+assert hashlib.sha256(reference_path.read_bytes()).hexdigest() == (
+    '16510baf94a06c678c3eea242115ae2278151d5af41669c35a08b3150e2acff5'
+)
+import shrincs_reference as shrincs
+
+seed = secrets.token_bytes(48)
+# UXMSS (unbalanced), depth 255: counters 0 through 255 are usable.
+sf_structure = bytes([shrincs.FXMSS_SHAPE_UNBALANCED, 255])
+secret_key, public_key = shrincs.shrincs_keygen(seed, sf_structure)
+assert len(secret_key) == 82 and len(public_key) == 48
+
+# An existing expanded secret key already contains the public key components.
+assert secret_key[32:64] + secret_key[66:82] == public_key
+
+message_hash = hashlib.sha256(b'the thing being signed').digest()
+
+# Demonstration only: this fresh key uses counter 0 once and is discarded.
+# A persistent signer must reserve counters durably as described below.
+stateful_signature = shrincs.shrincs_sign(
+    message=message_hash,
+    ctx=b'',
+    shrincs_seckey=secret_key,
+    state_ctr=0,
+    opt_rand=None,  # Ignored on the stateful path.
+)
+assert stateful_signature is not None
+assert shrincs.shrincs_verify(message_hash, stateful_signature, b'', public_key)
+
+# Stateless fallback: no state counter required, under the same public key.
+stateless_signature = shrincs.shrincs_sign(
+    message=message_hash,
+    ctx=b'',
+    shrincs_seckey=secret_key,
+    state_ctr=None,
+    opt_rand=secrets.token_bytes(16),  # None selects deterministic signing.
+)
+assert stateless_signature is not None
+assert shrincs.shrincs_verify(message_hash, stateless_signature, b'', public_key)
+
+print('Public key bytes:', len(public_key))
+print('Stateful signature bytes:', len(stateful_signature))
+print('Stateless signature bytes:', len(stateless_signature))
+```
+
+Pass `public_key`, `message_hash`, and either signature directly as the three
+binary atoms to `verify.clsp`. They are raw bytes, not ASCII hex strings. The
+Python `shrincs_verify` call above returns a boolean; this repository's Chialisp
+verifier returns nil on success and raises on rejection.
+
+### Stateful signing and backups
+
+Never sign different messages with the same key and stateful counter. For a
+persistent signer, reserve a counter exclusively and durably advance the stored
+next counter **before releasing its signature**. Reservations must survive
+crashes and resist rollback; concurrent signers must not allocate the same
+counter. A failed signing attempt can burn a reserved counter. The reference's
+`shrincs_sign` does not perform any of this bookkeeping.
+
+If a backup is restored without trustworthy current counter state, use
+`state_ctr=None` for stateless signing; do not reset the counter to zero.
+Stateless signing requires no persistent counter, but the draft still limits
+its per-key signature budget to `2**40` signatures.
+
+The unbalanced depth-255 configuration above supports 256 stateful signatures,
+starting with the smallest signatures. A balanced tree uses
+`bytes([shrincs.FXMSS_SHAPE_BALANCED, depth])` and, for positive depths, supports
+`2**depth` stateful signatures of constant size. Balanced key generation costs
+exponential work in the depth, so do not substitute 255 as a balanced depth.
+The reference automatically falls back to stateless signing when the chosen
+stateful tree is exhausted.
+
 ## Build and test
 
 Use a compiler supporting `(include *standard-cl-26*)`. The tests use
