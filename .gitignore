@@ -1,0 +1,4 @@
+__pycache__/
+verify.clvm
+verify.hex
+verify.sym

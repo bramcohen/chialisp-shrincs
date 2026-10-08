@@ -1,0 +1,127 @@
+; SHRINCS BIP verifier. Inputs are three atoms; success is (), rejection raises.
+(mod (PUBLIC_KEY MESSAGE_HASH SIGNATURE)
+  (include *standard-cl-26*)
+
+  (defconstant Z48 0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000)
+  (defconstant Z12 0x000000000000000000000000)
+
+  ; CLVM integers are signed and variable width. Wire integers are unsigned BE.
+  (defun uint (BYTES) (+ (concat 0x00 BYTES) 0))
+  (defun be (N SIZE)
+    (assign PAD (concat Z12 N)
+      (substr PAD (- (strlen PAD) SIZE))))
+  (defun byte-at (S I) (uint (substr S I (+ I 1))))
+  (defun prefix (HEIGHT INDEX TYPE)
+    (concat (be HEIGHT 1) (be INDEX 8) (be TYPE 1)))
+  (defun address (PREFIX W1 W2 W3)
+    (concat PREFIX (be W1 4) (be W2 4) (be W3 4)))
+  (defun thash (SEED ADDRESS DATA)
+    (substr (sha256 SEED Z48 ADDRESS DATA) 0 16))
+
+  (defun nibble (DATA I)
+    (logand 15 (ash (byte-at DATA (ash I -1)) (if (logand I 1) 0 -4))))
+  (defun nibble-sum (DATA I SUM)
+    (if (= I 32) SUM (nibble-sum DATA (+ I 1) (+ SUM (nibble DATA I)))))
+
+  ; Complete a WOTS chain from the signature's digit through hash index 14.
+  (defun chain (SEED PREFIX KEYPAIR CHAIN STEP NODE)
+    (if (= STEP 15) NODE
+      (chain SEED PREFIX KEYPAIR CHAIN (+ STEP 1)
+        (thash SEED (address PREFIX KEYPAIR CHAIN STEP) NODE))))
+  (defun wots (SEED PREFIX KEYPAIR SIG DIGITS COUNT I TIPS)
+    (if (= I COUNT) TIPS
+      (wots SEED PREFIX KEYPAIR SIG DIGITS COUNT (+ I 1)
+        (concat TIPS
+          (chain SEED PREFIX KEYPAIR I (nibble DIGITS I)
+            (substr SIG (* I 16) (* (+ I 1) 16)))))))
+
+  ; Merkle paths for stateless XMSS and FORS (the latter uses a global index).
+  (defun merkle (SEED PREFIX KEYPAIR HEIGHT LIMIT INDEX AUTH NODE)
+    (if (= HEIGHT LIMIT) NODE
+      (assign SIBLING (substr AUTH (* HEIGHT 16) (* (+ HEIGHT 1) 16))
+        (merkle SEED PREFIX KEYPAIR (+ HEIGHT 1) LIMIT (ash INDEX -1) AUTH
+          (thash SEED (address PREFIX KEYPAIR (+ HEIGHT 1) (ash INDEX -1))
+            (if (logand INDEX 1) (concat SIBLING NODE) (concat NODE SIBLING)))))))
+
+  ; Stateful addresses put node height/index in the prefix instead.
+  (defun fxmss-path (SEED HEIGHT INDEX AUTH OFFSET NODE)
+    (if (= HEIGHT 255) NODE
+      (assign SIBLING (substr AUTH OFFSET (+ OFFSET 16))
+        (fxmss-path SEED (+ HEIGHT 1) (ash INDEX -1) AUTH (+ OFFSET 16)
+          (thash SEED (concat (prefix (+ HEIGHT 1) (ash INDEX -1) 18) Z12)
+            (if (logand INDEX 1) (concat SIBLING NODE) (concat NODE SIBLING)))))))
+
+  (defun stateful (SEED SL_ROOT SF_ROOT MSG SIG HEIGHT)
+    (assign
+      DEPTH (- 255 HEIGHT)
+      INDEX_SIZE (if (> DEPTH 64) 8 (ash (+ DEPTH 7) -3))
+      START (+ 17 INDEX_SIZE)
+      INDEX (uint (substr SIG 17 START))
+      (if (all (= (strlen SIG) (+ START 514 (* DEPTH 16)))
+               (> (ash 1 (if (> DEPTH 64) 64 DEPTH)) INDEX))
+        (assign
+          R (substr SIG 1 17)
+          LEAF (concat (be HEIGHT 1) (be INDEX 8))
+          DIGEST (sha256 R SEED
+                   (sha256 R SEED SF_ROOT LEAF 0x0000 SL_ROOT MSG) LEAF)
+          DIGITS (substr (sha256 SEED Z48 (prefix HEIGHT INDEX 22) DIGEST
+                          0x00000000 (substr SIG START (+ START 2))) 0 16)
+          (if (= (nibble-sum DIGITS 0 0) 240)
+            (assign
+              TIPS (wots SEED (prefix HEIGHT INDEX 16) 0
+                     (substr SIG (+ START 2) (+ START 514)) DIGITS 32 0 ())
+              NODE (thash SEED (concat (prefix HEIGHT INDEX 17) Z12) TIPS)
+              (fxmss-path SEED HEIGHT INDEX (substr SIG (+ START 514)) 0 NODE))
+            (x)))
+        (x))))
+
+  ; FORS reads ten 13-bit indices from the leading 130 bits of the digest.
+  (defun fors (SEED TREE LEAF SIG DIGEST I ROOTS)
+    (if (= I 10)
+      (thash SEED (address (prefix 0 TREE 4) LEAF 0 0) ROOTS)
+      (assign
+        INDEX (+ (* I 8192) (logand 8191 (ash DIGEST (- 0 (* 13 (- 9 I))))))
+        START (* I 224)
+        NODE (thash SEED (address (prefix 0 TREE 3) LEAF 0 INDEX)
+               (substr SIG START (+ START 16)))
+        ROOT (merkle SEED (prefix 0 TREE 3) LEAF 0 13 INDEX
+               (substr SIG (+ START 16) (+ START 224)) NODE)
+        (fors SEED TREE LEAF SIG DIGEST (+ I 1) (concat ROOTS ROOT)))))
+
+  (defun hypertree (SEED SIG LAYER TREE LEAF MSG)
+    (if (= LAYER 5) MSG
+      (assign
+        CHECKSUM (- 480 (nibble-sum MSG 0 0))
+        DIGITS (concat MSG (be (ash CHECKSUM 4) 2))
+        START (* LAYER 704)
+        TIPS (wots SEED (prefix LAYER TREE 0) LEAF
+               (substr SIG START (+ START 560)) DIGITS 35 0 ())
+        NODE (thash SEED (address (prefix LAYER TREE 1) LEAF 0 0) TIPS)
+        ROOT (merkle SEED (prefix LAYER TREE 2) 0 0 9 LEAF
+               (substr SIG (+ START 560) (+ START 704)) NODE)
+        (hypertree SEED SIG (+ LAYER 1) (ash TREE -9) (logand TREE 511) ROOT))))
+
+  (defun stateless (SEED SL_ROOT SF_ROOT MSG SIG)
+    (if (= (strlen SIG) 5777)
+      (assign
+        R (substr SIG 1 17)
+        DIGEST (sha256 R SEED (sha256 R SEED SL_ROOT 0x0000 SF_ROOT MSG) 0x00000000)
+        TREE (logand (uint (substr DIGEST 17 22)) 0x0fffffffff)
+        LEAF (logand (uint (substr DIGEST 22 24)) 511)
+        FORS_DIGEST (ash (uint (substr DIGEST 0 17)) -6)
+        ROOT (fors SEED TREE LEAF (substr SIG 17 2257) FORS_DIGEST 0 ())
+        (hypertree SEED (substr SIG 2257) 0 TREE LEAF ROOT))
+      (x)))
+
+  (if (all (= (strlen PUBLIC_KEY) 48) (= (strlen MESSAGE_HASH) 32)
+           (> (strlen SIGNATURE) 0))
+    (assign
+      SEED (substr PUBLIC_KEY 0 16)
+      SL_ROOT (substr PUBLIC_KEY 16 32)
+      SF_ROOT (substr PUBLIC_KEY 32 48)
+      HEIGHT (byte-at SIGNATURE 0)
+      (if (= HEIGHT 255)
+        (if (= (stateless SEED SL_ROOT SF_ROOT MESSAGE_HASH SIGNATURE) SL_ROOT) () (x))
+        (if (= (stateful SEED SL_ROOT SF_ROOT MESSAGE_HASH SIGNATURE HEIGHT) SF_ROOT) () (x))))
+    (x))
+)
